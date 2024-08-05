@@ -3,17 +3,27 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const mongoose = require('mongoose');
+const bcrypt = require('bcrypt');
 const UserModel = require('./Models/Users'); // Ensure the path is correct
 const app = express();
-const port = process.env.PORT || 3001; // Use the environment variable for port
+const port = process.env.PORT || 3001;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Blynk Auth Tokens from environment variables
-const PLANT_WATERING_AUTH_TOKEN = process.env.PLANT_WATERING_AUTH_TOKEN;
-const GAS_TEMPERATURE_HUMIDITY_AUTH_TOKEN = process.env.GAS_TEMPERATURE_HUMIDITY_AUTH_TOKEN;
+// ThingSpeak channel configurations
+const THINGSPEAK_CHANNELS = {
+  OLD: {
+    READ_API_KEY: process.env.THINGSPEAK_READ_API_KEY_OLD,
+    WRITE_API_KEY: process.env.THINGSPEAK_WRITE_API_KEY_OLD,
+    CHANNEL_ID: process.env.THINGSPEAK_CHANNEL_ID_OLD,
+  },
+  NEW: {
+    READ_API_KEY: process.env.THINGSPEAK_READ_API_KEY_NEW,
+    WRITE_API_KEY: process.env.THINGSPEAK_WRITE_API_KEY_NEW,
+    CHANNEL_ID: process.env.THINGSPEAK_CHANNEL_ID_NEW,
+  },
+};
 
 // MongoDB connection using environment variable for URI
 mongoose.connect(process.env.MONGO_URI, {
@@ -33,7 +43,8 @@ app.post('/login', async (req, res) => {
   try {
     const user = await UserModel.findOne({ email });
     if (user) {
-      if (user.password === password) {
+      const isMatch = await bcrypt.compare(password, user.password);
+      if (isMatch) {
         res.json({ message: 'Success', user });
       } else {
         res.status(401).json({ message: 'Incorrect password' });
@@ -49,8 +60,10 @@ app.post('/login', async (req, res) => {
 
 // Registration endpoint
 app.post('/register', async (req, res) => {
+  const { email, password } = req.body;
   try {
-    const newUser = await UserModel.create(req.body);
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUser = await UserModel.create({ email, password: hashedPassword });
     res.json(newUser);
   } catch (err) {
     console.error('Error registering user:', err);
@@ -58,59 +71,81 @@ app.post('/register', async (req, res) => {
   }
 });
 
-// Plant Watering System endpoints
-app.get('/api/moisture', async (req, res) => {
+// Helper function to fetch data from ThingSpeak
+async function fetchData(channel, field) {
   try {
-    const response = await axios.get(`http://blynk.cloud/external/api/get?token=${PLANT_WATERING_AUTH_TOKEN}&V0`);
-    res.json({ moisture: response.data });
+    const response = await axios.get(`https://api.thingspeak.com/channels/${channel.CHANNEL_ID}/fields/${field}.json?api_key=${channel.READ_API_KEY}&results=1`);
+    const data = response.data.feeds[0][`field${field}`];
+    if (data && !isNaN(data) && data !== 'nan') {
+      return { data };
+    } else {
+      throw new Error(`${field} data is invalid or unavailable`);
+    }
   } catch (error) {
-    console.error('Error fetching moisture level:', error);
-    res.status(500).send('Error fetching moisture level');
+    console.error(`Error fetching ${field} data:`, error.response ? error.response.data : error.message);
+    throw new Error(`Error fetching ${field} data`);
   }
-});
+}
 
-app.post('/api/water', async (req, res) => {
-  const { state } = req.body; // State should be 'on' or 'off'
-  const pinValue = state === 'on' ? 1 : 0;
-
-  try {
-    await axios.get(`http://blynk.cloud/external/api/update?token=${PLANT_WATERING_AUTH_TOKEN}&V1=${pinValue}`);
-    res.send('Water pump state updated');
-  } catch (error) {
-    console.error('Error updating water pump state:', error);
-    res.status(500).send('Error updating water pump state');
-  }
-});
-
-// Gas, Temperature, and Humidity Monitoring endpoints
-app.get('/api/gas', async (req, res) => {
-  try {
-    const response = await axios.get(`http://blynk.cloud/external/api/get?token=${GAS_TEMPERATURE_HUMIDITY_AUTH_TOKEN}&V2`);
-    res.json({ gas: response.data });
-  } catch (error) {
-    console.error('Error fetching gas level:', error);
-    res.status(500).send('Error fetching gas level');
-  }
-});
-
+// Temperature endpoint for old channel
 app.get('/api/temperature', async (req, res) => {
   try {
-    const response = await axios.get(`http://blynk.cloud/external/api/get?token=${GAS_TEMPERATURE_HUMIDITY_AUTH_TOKEN}&V3`);
-    res.json({ temperature: response.data });
+    const oldData = await fetchData(THINGSPEAK_CHANNELS.OLD, 1);
+    res.json({ temperature: oldData.data });
   } catch (error) {
-    console.error('Error fetching temperature:', error);
-    res.status(500).send('Error fetching temperature');
+    res.status(500).send(error.message);
   }
 });
 
+// Humidity endpoint for old channel
 app.get('/api/humidity', async (req, res) => {
   try {
-    const response = await axios.get(`http://blynk.cloud/external/api/get?token=${GAS_TEMPERATURE_HUMIDITY_AUTH_TOKEN}&V4`);
-    res.json({ humidity: response.data });
+    const oldData = await fetchData(THINGSPEAK_CHANNELS.OLD, 2);
+    res.json({ humidity: oldData.data });
   } catch (error) {
-    console.error('Error fetching humidity level:', error);
-    res.status(500).send('Error fetching humidity level');
+    res.status(500).send(error.message);
   }
+});
+
+// Gas Monitoring endpoint for old channel
+app.get('/api/gas', async (req, res) => {
+  try {
+    const oldData = await fetchData(THINGSPEAK_CHANNELS.OLD, 3);
+    res.json({ gas: oldData.data });
+  } catch (error) {
+    res.status(500).send(error.message);
+  }
+});
+
+// Flame Detection endpoint for old channel
+app.get('/api/flame', async (req, res) => {
+  try {
+    const oldData = await fetchData(THINGSPEAK_CHANNELS.OLD, 4);
+    res.json({ flame: oldData.data });
+  } catch (error) {
+    res.status(500).send(error.message);
+  }
+});
+
+// Plant Watering System endpoint for new channel
+app.get('/api/plant-watering/moisture', async (req, res) => {
+  try {
+    const newData = await fetchData(THINGSPEAK_CHANNELS.NEW, 1);
+    res.json({ moisture: newData.data });
+  } catch (error) {
+    res.status(500).send(error.message);
+  }
+});
+
+// Pump control endpoint
+app.post('/api/pump-control', (req, res) => {
+  const { action } = req.body;
+  if (!action) {
+    return res.status(400).send('Action is required');
+  }
+  // Your logic to handle the pump action
+  console.log(`Pump action: ${action}`);
+  res.send(`Pump action ${action} executed`);
 });
 
 // Start the server
